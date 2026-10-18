@@ -27,7 +27,7 @@
  * 0x20 0x26, and 0x26 is exactly the WRSDeviceIds value of the "FGB" template.
  * --list prints WRSDeviceIds for every device so you can match yours.
  *
- * Licence: 0BSD (Zero-Clause BSD)
+ * Licence: The Unlicense
  */
 
 'use strict';
@@ -194,7 +194,10 @@ function main() {
             const t = TYPES[r.wolfType]; if (!t) continue;
             
             let n = slug(r.name);
-            if (/^[0-9]/.test(n)) {
+            const numericPrefix = n.match(/^([0-9][^_]*)_(.+)$/);
+            if (numericPrefix) {
+                n = `${numericPrefix[2]}_${numericPrefix[1]}`;
+            } else if (/^[0-9]/.test(n)) {
                 n = 'num_' + n;
             }
             

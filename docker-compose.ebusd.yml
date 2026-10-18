@@ -1,0 +1,23 @@
+ebusd:
+    image: john30/ebusd:latest
+    container_name: ebusd
+    restart: unless-stopped
+    volumes:
+      - ./custom-wolf/wolf_all.csv:/etc/ebusd/wolf_all.csv:ro
+    ports:
+      - 8888:8888" # ebusctl access
+    command:
+      - "--foreground"
+      - "--configpath=/etc/ebusd"
+      - "-d"
+      - "ens:192.168.xx.yy:9999" 
+      - --loglevel=error
+      - --mqtthost=192.168.xx.yy
+      - --mqttport=1883
+      - --mqttjson
+      # Home Assistant discovery
+      - --mqttint=/etc/ebusd/mqtt-hassio.cfg
+      - --mqttuser=ebusd
+      - --mqttpass=<pass>
+      - --pollinterval=60
+      - --latency=20000
