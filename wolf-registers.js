@@ -188,6 +188,11 @@ const slug = s => (s || '')
     .replace(/[äÄ]/g, 'ae').replace(/[öÖ]/g, 'oe').replace(/[üÜ]/g, 'ue').replace(/ß/g, 'ss')
     .replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase().slice(0, 40) || 'unnamed';
 
+/* ebusd poll priority: rN is polled about every N-th poll round, so lower means more often.
+ * Wolf marks measured values as read-only; settings rarely change and are polled least often. */
+const POLL_MEASUREMENT = 1, POLL_STATUS = 3, POLL_SETTING = 9;
+const pollPriority = (r, dec) => !r.readOnly ? POLL_SETTING : dec.unit ? POLL_MEASUREMENT : POLL_STATUS;
+
 /** ebusd name from a Wolf name: slug, numeric-leading first segment moved to the end, num_ fallback. */
 function ebusName(s) {
     let n = slug(s);
@@ -302,6 +307,7 @@ function main() {
     }
     console.log('# read  ID = <crc8 poly 0x5c over low byte, XOR high byte><TelegramNr LE>');
     console.log('# write ID = 00<TelegramNr LE>, plus a 4-byte suffix 9d010000');
+    console.log(`# poll priority: r${POLL_MEASUREMENT} read-only values with unit and bitfields, r${POLL_STATUS} other read-only values, r${POLL_SETTING} settings`);
     console.log('# write address = master address of the read address (read address - 5); verified only for 08 -> 03');
 
     const seenReadIds = new Map();
@@ -392,7 +398,8 @@ function main() {
             // ---- READ ROW ----
             const prefix = isVariant ? '#' : '';
             if (!isVariant) readRowsEmitted++;
-            console.log(`${prefix}r5,${cls},${finalN},${cmt},,${readAddress},5022,${readIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note}`);
+            const prio = pollPriority(r, dec);
+            console.log(`${prefix}r${prio},${cls},${finalN},${cmt},,${readAddress},5022,${readIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note}`);
 
             // ---- WRITE ROW ----
             if (has('--write') && writeAddress && !r.readOnly && !dec.note && /NumericInput|ComboBox/.test(r.ctrl || '') && r.min !== '') {
@@ -446,7 +453,7 @@ function main() {
             seenReadIds.set(key, new Map([['bits', { cls: g.cls, device: '' }]]));
             readRowsEmitted++;
         }
-        console.log(`${prefix}r5,${g.cls},${name},Bitfield TelegramNr ${g.tn},,${g.address},5022,${readIdStr},${fields.join(',')}`);
+        console.log(`${prefix}r${POLL_MEASUREMENT},${g.cls},${name},Bitfield TelegramNr ${g.tn},,${g.address},5022,${readIdStr},${fields.join(',')}`);
     }
     if (variantsEmitted.length) {
         console.error(`\n# ${variantsEmitted.length} metadata variants emitted commented out (same ID, different type/divider/unit). ebusd allows only one definition per ID; swap one in if it matches your device better:`);

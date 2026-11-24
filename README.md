@@ -155,6 +155,23 @@ such as:
 {{ '%04d-%02d-%02d' | format(2000 + (v // 512), (v // 32) % 16 + 1, v % 32 + 1) }}
 ```
 
+Poll priority: ebusd polls a message with priority `rN` about every N-th
+poll round, so a lower number means more frequent updates. Wolf marks
+measured values as read-only, which the generator uses:
+
+| Priority | Parameters |
+|---|---|
+| `r1` | read-only values with a unit (temperatures, pressure, power) and bitfields (pumps, compressor) |
+| `r3` | other read-only values (status, operating mode, firmware) |
+| `r9` | settings |
+
+ebusd itself polls one message per `--pollinterval` seconds. Values that
+another bus participant (for example an ISM7 module) reads are also picked up
+passively as they appear on the bus. Note that the stock `mqtt-hassio.cfg`
+sets `filter-seen = 5`, which caps the priority of every message published to
+Home Assistant at 5; use `--mqttvar=filter-seen=1` to keep the generated
+priorities.
+
 Write rows are only generated for parameters Wolf marks as editable (numeric
 input or selection list, not read-only). Time and date parameters are read-only
 in the generated CSV.
