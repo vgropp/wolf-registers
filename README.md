@@ -126,12 +126,45 @@ supported Wolf types to ebusd types. Read IDs use the checksum implemented by
 the script; write IDs use the separate, unchecked write format described in
 [HISTORY.md](./HISTORY.md).
 
-Not every metadata entry can be emitted: unsupported data types and bitfields
-are skipped in CSV output; the non-CSV register listing includes bitfields and
-parameters without a TelegramNr for reference. Generated rows should be
-checked against your device and ebusd version before use. The CSV header
-documents each selected template's DTID and WRSDeviceIds, plus the read-ID
-checksum and write format.
+Type mapping:
+
+| Wolf metadata | ebusd CSV |
+|---|---|
+| Numeric types (`US`, `SS`, `SS10`, ...) | `UIN`/`SIN` with divider |
+| Value list (`KeyValueList`, e.g. `0;Keine;1;3 kW`) | ebusd value list `0=Keine;1=3 kW`, so ebusd and Home Assistant show the text |
+| Bitfields (one parameter per bit of a telegram) | one message `bits_<TelegramNr>` with one `BIn` field per bit |
+| Time (`BM2Time`) | `VTM` (hh:mm) |
+| Date (`BM2Date`) | raw `UIN` named `<name>_raw`; see below |
+
+Bitfields: Wolf defines each bit as its own parameter, but ebusd accepts only
+one message per address and ID. The generator therefore combines all bits of a
+telegram into one message with one field per bit. ebusd only moves on to the
+second byte after bit 7, so a field named `reserved` pads the first byte when
+needed. If several selected templates define bits of the same telegram at the
+same address, they are merged into one message in the class of the first
+template. To hide the padding field in Home Assistant, add `^reserved$` to the field filter:
+`--mqttvar=filter-non-field=^sensor$|^reserved$`.
+
+Dates: `BM2Date` packs the date into bits (day in bits 0-4, month in bits 5-8,
+year in bits 9-15, each with an offset), which no ebusd type can decode. The raw
+value is emitted instead, and can be decoded in Home Assistant with a template
+such as:
+
+```jinja
+{% set v = states('sensor.ebusd_bm_2_datum_ende_raw') | int(0) %}
+{{ '%04d-%02d-%02d' | format(2000 + (v // 512), (v // 32) % 16 + 1, v % 32 + 1) }}
+```
+
+Write rows are only generated for parameters Wolf marks as editable (numeric
+input or selection list, not read-only). Time and date parameters are read-only
+in the generated CSV.
+
+Not every metadata entry can be emitted: other unsupported data types and
+parameters without a TelegramNr (for example counters that Wolf combines from
+several telegrams) are skipped in CSV output; the non-CSV register listing
+includes them for reference. Generated rows should be checked against your
+device and ebusd version before use. The CSV header documents each selected
+template's DTID and WRSDeviceIds, plus the read-ID checksum and write format.
 
 ## Project history
 

@@ -84,6 +84,40 @@ const TYPES = {
     UINT32: ['UIN', ''],   // these come back as 16-bit on the devices tested
 };
 
+/** Wolf KeyValueList "0;Aus;1;Ein" -> ebusd value list "0=Aus;1=Ein", or '' if it cannot be mapped. */
+function valueList(kvl) {
+    if (!kvl) return '';
+    const parts = kvl.replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&quot;/g, "'")
+        .replace(/&apos;/g, "'").replace(/&amp;/g, '&').split(';');
+    if (parts.length % 2) return '';
+    const out = [], keys = new Set();
+    for (let i = 0; i < parts.length; i += 2) {
+        const key = parts[i].trim();
+        if (!/^-?\d+$/.test(key) || keys.has(key)) return '';
+        keys.add(key);
+        const text = parts[i + 1].replace(/[\r\n,;="]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!text) return '';
+        out.push(`${key}=${text}`);
+    }
+    return out.join(';');
+}
+
+/** ebusd decoding for a non-bitfield register: {type, div (divider or value list), unit, note, suffix}, or null. */
+function decodingFor(r) {
+    // BM2Time: high byte hours, low byte minutes; on the wire minutes come first, which is ebusd's VTM.
+    if (r.wolfType === 'BM2Time') return { type: 'VTM', div: '', unit: '', note: ' BM2Time', suffix: '' };
+    // BM2Date packs day/month/year into bits; ebusd has no matching type, so expose the raw value.
+    if (r.wolfType === 'BM2Date') {
+        return { type: 'UIN', div: '', unit: '', suffix: '_raw',
+                 note: ' BM2Date raw: day=(v&31)+1 month=((v>>5)&15)+1 year=2000+(v>>9)' };
+    }
+    const t = TYPES[r.wolfType];
+    if (!t) return null;
+    let values = t[1] === '' && r.wolfType !== 'UINT32' ? valueList(r.kvl) : '';
+    if (/(^|;)-/.test(values)) values = ''; // ebusd value lists do not accept negative keys
+    return { type: t[0], div: values || t[1], unit: r.unit || '', note: '', suffix: '' };
+}
+
 function get(url, dest) {
     return new Promise((resolve, reject) => {
         https.get(url, res => {
@@ -122,7 +156,8 @@ function load() {
         const id = +m[2], b = m[3];
         const g = t => { const r = b.match(new RegExp('<' + t + '>([^<]*)</' + t + '>')); return r ? r[1] : ''; };
         P[id] = { name: g('Name'), unit: g('UnitName'), min: g('MinValueCondition'),
-                  max: g('MaxValueCondition'), ctrl: g('ControlType'), kvl: g('KeyValueList') };
+                  max: g('MaxValueCondition'), ctrl: g('ControlType'), kvl: g('KeyValueList'),
+                  readOnly: g('ReadOnlyConditionId') === 'True' };
     }
     // devices
     const D = [];
@@ -144,7 +179,7 @@ function rows(device, C, P) {
         if (!c || !p) continue;
         out.push({ ptid: id, tn: c.tn === null ? null : +c.tn, wolfType: c.type, bit: c.bit,
                    tag: c.tag, name: p.name, unit: p.unit, min: p.min, max: p.max,
-                   ctrl: p.ctrl, kvl: p.kvl });
+                   ctrl: p.ctrl, kvl: p.kvl, readOnly: p.readOnly });
     }
     return out.sort((a, b) => (a.tn ?? 1e9) - (b.tn ?? 1e9));
 }
@@ -152,6 +187,16 @@ function rows(device, C, P) {
 const slug = s => (s || '')
     .replace(/[äÄ]/g, 'ae').replace(/[öÖ]/g, 'oe').replace(/[üÜ]/g, 'ue').replace(/ß/g, 'ss')
     .replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase().slice(0, 40) || 'unnamed';
+
+/** ebusd name from a Wolf name: slug, numeric-leading first segment moved to the end, num_ fallback. */
+function ebusName(s) {
+    let n = slug(s);
+    const numericPrefix = n.match(/^([0-9][^_]*)_(.+)$/);
+    if (numericPrefix) n = `${numericPrefix[2]}_${numericPrefix[1]}`;
+    if (/^[0-9]/.test(n)) n = 'num_' + n;
+    return n;
+}
+
 
 /** Text for a CSV field: no separators, quotes or line breaks. */
 const csvText = s => (s || '').replace(/[\r\n,";]/g, ' ').trim();
@@ -264,6 +309,19 @@ function main() {
     const seenWriteIds = new Set();
     const variantsEmitted = [];
     let readRowsEmitted = 0;
+    // Bitfields: Wolf defines one parameter per bit of a 16-bit telegram. ebusd allows one message per
+    // ID, so all bits of a telegram (at one address) are collected and emitted as one multi-field message.
+    const bitGroups = new Map();
+    const collectBit = (dev, cls, r) => {
+        const key = JSON.stringify([dev.address, readId(r.tn)]);
+        if (!bitGroups.has(key)) bitGroups.set(key, { cls, address: dev.address, tn: r.tn, bits: new Map() });
+        const group = bitGroups.get(key), bit = +r.bit;
+        const values = valueList(r.kvl);
+        const bitValues = values.split(';').every(v => /^[01]=/.test(v)) ? values : '';
+        if (Number.isInteger(bit) && bit >= 0 && bit <= 15 && !group.bits.has(bit)) {
+            group.bits.set(bit, { name: r.name, values: bitValues });
+        }
+    };
     const seenNamesPerClass = new Map();
     const classOverride = want('--class');
 
@@ -285,17 +343,12 @@ function main() {
         let skippedShared = 0;
 
         for (const r of R) {
-            if (r.tn === null || r.bit !== null) continue; // bitfields need hand-shaping
-            const t = TYPES[r.wolfType]; if (!t) continue;
-
-            let n = slug(r.name);
-            const numericPrefix = n.match(/^([0-9][^_]*)_(.+)$/);
-            if (numericPrefix) {
-                n = `${numericPrefix[2]}_${numericPrefix[1]}`;
-            }
-            if (/^[0-9]/.test(n)) {
-                n = 'num_' + n;
-            }
+            if (r.tn === null) continue;
+            if (r.bit !== null) { collectBit(dev, cls, r); continue; } // emitted per telegram below
+            const dec = decodingFor(r);
+            if (!dec) continue;
+            const t = [dec.type, dec.div];
+            const n = ebusName(r.name) + dec.suffix;
 
             const readIdStr = readId(r.tn);
             const readAddress = dev.address;
@@ -304,7 +357,7 @@ function main() {
             // PRELOAD_Firmware UIN vs Firmware SIN/100). ebusd rejects a second message with the
             // same ID ("duplicate ID"), so variants are emitted commented out for the user to swap in.
             const readKey = JSON.stringify([readAddress, readIdStr]);
-            const decodeKey = JSON.stringify([t[0], t[1], r.unit || '']);
+            const decodeKey = JSON.stringify([t[0], t[1], dec.unit]);
             if (!seenReadIds.has(readKey)) seenReadIds.set(readKey, new Map());
             const decodings = seenReadIds.get(readKey);
             const previousRead = decodings.get(decodeKey);
@@ -339,15 +392,15 @@ function main() {
             // ---- READ ROW ----
             const prefix = isVariant ? '#' : '';
             if (!isVariant) readRowsEmitted++;
-            console.log(`${prefix}r5,${cls},${finalN},${cmt},,${readAddress},5022,${readIdStr},${finalN},,${t[0]},${t[1]},${csvText(r.unit)},TelegramNr ${r.tn}`);
+            console.log(`${prefix}r5,${cls},${finalN},${cmt},,${readAddress},5022,${readIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note}`);
 
             // ---- WRITE ROW ----
-            if (has('--write') && writeAddress && /NumericInput|ComboBox/.test(r.ctrl || '') && r.min !== '') {
+            if (has('--write') && writeAddress && !r.readOnly && !dec.note && /NumericInput|ComboBox/.test(r.ctrl || '') && r.min !== '') {
                 const writeIdStr = writeId(r.tn);
                 const writeKey = JSON.stringify([writeAddress, writeIdStr, decodeKey]);
                 if (!seenWriteIds.has(writeKey)) {
                     seenWriteIds.add(writeKey);
-                    console.log(`${prefix}w,${cls},${finalN},${cmt},,${writeAddress},5023,${writeIdStr},${finalN},,${t[0]},${t[1]},${csvText(r.unit)},TelegramNr ${r.tn},suffix,,HEX:4,=9d010000,,`);
+                    console.log(`${prefix}w,${cls},${finalN},${cmt},,${writeAddress},5023,${writeIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note},suffix,,HEX:4,=9d010000,,`);
                 }
             }
         }
@@ -357,6 +410,43 @@ function main() {
                 `If ${dev.reqName} is a separate bus device, map its address with --address ${dev.template.name}=<ZZ>.`
             );
         }
+    }
+    for (const g of bitGroups.values()) {
+        if (!g.bits.size) continue;
+        const readIdStr = readId(g.tn);
+        const key = JSON.stringify([g.address, readIdStr]);
+        const conflict = seenReadIds.has(key); // the same ID is already used by a plain register
+        const fieldNames = new Set(['reserved']); // padding field name, see below
+        const fieldName = bit => {
+            const base = ebusName(g.bits.get(bit).name);
+            let f = base, i = 2;
+            while (fieldNames.has(f)) f = base + '_' + (i++);
+            fieldNames.add(f);
+            return f;
+        };
+        const bits = [...g.bits.keys()].sort((a, b) => a - b);
+        const low = bits.filter(b => b < 8), high = bits.filter(b => b >= 8);
+        const fields = low.map(b => `${fieldName(b)},,BI${b},${g.bits.get(b).values},,`);
+        if (high.length) {
+            // ebusd moves to the next byte only after bit 7 is consumed: pad the low byte.
+            if (!low.length) fields.push(',,IGN:1,,,');
+            else if (low[low.length - 1] < 7) {
+                const start = low[low.length - 1] + 1;
+                fields.push(`reserved,,BI${start}${start === 7 ? '' : ':' + (8 - start)},,,`);
+            }
+            high.forEach(b => fields.push(`${fieldName(b)},,BI${b - 8},${g.bits.get(b).values},,`));
+        }
+        const namesForClass = seenNamesPerClass.get(g.cls);
+        let name = `bits_${g.tn}`, i = 2;
+        while (namesForClass.has(name)) name = `bits_${g.tn}_${i++}`;
+        namesForClass.add(name);
+        const prefix = conflict ? '#' : '';
+        if (conflict) variantsEmitted.push(`${g.cls},${name} (bitfield TelegramNr ${g.tn} at ${g.address})`);
+        else {
+            seenReadIds.set(key, new Map([['bits', { cls: g.cls, device: '' }]]));
+            readRowsEmitted++;
+        }
+        console.log(`${prefix}r5,${g.cls},${name},Bitfield TelegramNr ${g.tn},,${g.address},5022,${readIdStr},${fields.join(',')}`);
     }
     if (variantsEmitted.length) {
         console.error(`\n# ${variantsEmitted.length} metadata variants emitted commented out (same ID, different type/divider/unit). ebusd allows only one definition per ID; swap one in if it matches your device better:`);
