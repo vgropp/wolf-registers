@@ -17,6 +17,10 @@
  *   node wolf-registers.js --device DHK_BM-2,MK_BM-2,WW_BM-2,WWSystem_BM-2,MM,ISM,CHA,BM-2            dump those devices' registers
  *   node wolf-registers.js --device DHK_BM-2,MK_BM-2,WW_BM-2,WWSystem_BM-2,MM,ISM,CHA,BM-2  --csv     emit ebusd CSV rows
  *   node wolf-registers.js --device DHK_BM-2,MK_BM-2,WW_BM-2,WWSystem_BM-2,MM,ISM,CHA,BM-2  --csv --write   also emit write rows
+ *   ... --csv --write --writable 10903,10905                also emit write rows for these TelegramNrs,
+ *                                                         even if Wolf marks them read-only
+ *   ... --write --ha-yaml 19,10912                         print Home Assistant MQTT entities (YAML) for
+ *                                                         these write rows instead of the CSV
  *   docker run --rm -v $(pwd):/app -w /app node:latest node wolf-registers.js --device DHK_BM-2,MK_BM-2,WW_BM-2,WWSystem_BM-2,MM,ISM,CHA,BM-2 --csv --write > wolf-all.csv
  *
  * It downloads three files (~5 MB) on first run and caches them next to itself.
@@ -61,6 +65,8 @@ const hx = n => n.toString(16).padStart(2, '0');
 
 /* eBUS master addresses have both nibbles in {0,1,3,7,f}; a master's slave address is master + 5. */
 const MASTER_NIBBLES = [0x0, 0x1, 0x3, 0x7, 0xf];
+// Write addresses confirmed on a real installation (see HISTORY.md and README).
+const VERIFIED_WRITE_ADDRESSES = ['03', '30'];
 const isMaster = a => MASTER_NIBBLES.includes(a >> 4) && MASTER_NIBBLES.includes(a & 0xf);
 /** Write destination for a read address: the master behind that slave address, or null if there is none. */
 function writeAddressFor(readAddress) {
@@ -157,7 +163,7 @@ function load() {
         const g = t => { const r = b.match(new RegExp('<' + t + '>([^<]*)</' + t + '>')); return r ? r[1] : ''; };
         P[id] = { name: g('Name'), unit: g('UnitName'), min: g('MinValueCondition'),
                   max: g('MaxValueCondition'), ctrl: g('ControlType'), kvl: g('KeyValueList'),
-                  readOnly: g('ReadOnlyConditionId') === 'True' };
+                  step: g('StepWidth'), readOnly: g('ReadOnlyConditionId') === 'True' };
     }
     // devices
     const D = [];
@@ -179,7 +185,7 @@ function rows(device, C, P) {
         if (!c || !p) continue;
         out.push({ ptid: id, tn: c.tn === null ? null : +c.tn, wolfType: c.type, bit: c.bit,
                    tag: c.tag, name: p.name, unit: p.unit, min: p.min, max: p.max,
-                   ctrl: p.ctrl, kvl: p.kvl, readOnly: p.readOnly });
+                   step: p.step, ctrl: p.ctrl, kvl: p.kvl, readOnly: p.readOnly });
     }
     return out.sort((a, b) => (a.tn ?? 1e9) - (b.tn ?? 1e9));
 }
@@ -206,6 +212,62 @@ function ebusName(s) {
 /** Text for a CSV field: no separators, quotes or line breaks. */
 const csvText = s => (s || '').replace(/[\r\n,";]/g, ' ').trim();
 
+/** Home Assistant MQTT entities (number/select) for ebusd write messages, as YAML on stdout. */
+function printHaYaml(entities, selection, prefix) {
+    // A JSON string is a valid double-quoted YAML scalar once U+2028/U+2029 (YAML line breaks) are escaped.
+    const q = v => JSON.stringify(String(v)).replace(/[\u2028\u2029]/g, c => '\\u' + c.charCodeAt(0).toString(16));
+    const num = v => (v !== '' && v !== undefined && v !== null && Number.isFinite(+v)) ? +v : null;
+    const numbers = [], selects = [];
+    // ebusd's %PREFIX: the topic prefix ("ebusd" without --mqtttopic) with every non-alphanumeric character as "_".
+    const deviceIdPrefix = prefix.replace(/[^A-Za-z0-9]/g, '_');
+    for (const e of entities) {
+        const topic = `${prefix}/${e.cls}/${e.name}`;
+        const common = [
+            `    - name: ${q(e.label || e.name)}`,
+            `      unique_id: ${q(`${prefix.replace(/\//g, '_')}_${e.cls}_${e.name}_set`)}`,
+            `      state_topic: ${q(topic)}`,
+            `      value_template: ${q(`{{ value_json['${e.name}'].value }}`)}`,
+            `      command_topic: ${q(topic + '/set')}`,
+            // Same device as ebusd's own discovery ("%{PREFIX}_%CIRCUIT" in mqtt-hassio.cfg), so the
+            // entities show up under the existing "ebusd <class>" device.
+            `      device:`,
+            `        identifiers: [${q(`${deviceIdPrefix}_${e.cls}`)}]`,
+            `        name: ${q(`${prefix} ${e.cls}`)}`, // ebusd's "%prefixn %circuit"
+        ];
+        if (String(e.div).includes('=')) {
+            // valueList() strips ";" and "=" from the texts, so splitting is safe.
+            const options = String(e.div).split(';').map(v => v.slice(v.indexOf('=') + 1));
+            if (!options.length || options.some(o => !o) || new Set(options).size !== options.length) {
+                console.error(`# --ha-yaml: no entity for TelegramNr ${e.tn} (${e.cls} ${e.name}): empty or duplicate option texts.`);
+                continue;
+            }
+            selects.push([...common, `      options: [${options.map(o => q(o)).join(', ')}]`].join('\n'));
+            continue;
+        }
+        const min = num(e.min), max = num(e.max), divider = num(e.div);
+        const step = +(num(e.step) || (divider && divider > 1 ? 1 / divider : 1)).toPrecision(6);
+        if (min === null || max === null || min > max || !(step > 0)) {
+            console.error(`# --ha-yaml: no entity for TelegramNr ${e.tn} (${e.cls} ${e.name}): no valid numeric range or step in the metadata.`);
+            continue;
+        }
+        const lines = [...common, `      min: ${min}`, `      max: ${max}`, `      step: ${step}`];
+        if (e.unit) lines.push(`      unit_of_measurement: ${q(e.unit)}`);
+        lines.push('      mode: box');
+        numbers.push(lines.join('\n'));
+    }
+    console.log('# Home Assistant MQTT entities for ebusd write messages, generated by wolf-registers.js.');
+    console.log(`# Topics assume ebusd runs with --mqtttopic=${prefix} and --mqttjson. Merge into the mqtt: section of configuration.yaml.`);
+    console.log('mqtt:');
+    if (numbers.length) console.log('  number:\n' + numbers.join('\n'));
+    if (selects.length) console.log('  select:\n' + selects.join('\n'));
+    if (selection) {
+        const found = new Set(entities.map(e => e.tn));
+        const missing = [...selection].filter(tn => !found.has(tn));
+        if (missing.length) console.error(`# --ha-yaml: no write row for TelegramNr ${missing.join(', ')}.`);
+    }
+    console.error(`# --ha-yaml: ${numbers.length} number and ${selects.length} select entities.`);
+}
+
 function main() {
     const argv = process.argv.slice(2);
     const want = (f) => {
@@ -225,7 +287,7 @@ function main() {
         D.sort((a, b) => a.name.localeCompare(b.name)).forEach(d =>
             console.log('  ' + String(d.dtid).padEnd(8) + String(d.wrs).padEnd(14) +
                         String(d.ptids.length).padEnd(8) + d.name));
-        console.log('\nThen: node wolf-registers.js --device <Name>,<Name2> [--address <Name>=<ZZ>,<Name2>=<ZZ>] [--class <name>] [--csv] [--write]');
+        console.log('\nThen: node wolf-registers.js --device <Name>,<Name2> [--address <Name>=<ZZ>,<Name2>=<ZZ>] [--class <name>] [--csv] [--write [--writable <TelegramNr>,...] [--ha-yaml all|<TelegramNr>,...] [--mqtt-prefix ebusd]]');
         return;
     }
 
@@ -275,7 +337,41 @@ function main() {
         dev.address = addresses.get(dev.template.name.toLowerCase()) || '08';
     }
 
-    const csv = has('--csv');
+    // TelegramNrs that get write rows even though Wolf marks them read-only (for example SmartHome set values).
+    /** Set of normalized TelegramNrs from a comma-separated option value; exits on invalid input. */
+    const telegramNrList = (value, option) => new Set(value.split(',').map(item => {
+        const tn = item.trim();
+        if (!/^[0-9]{1,5}$/.test(tn) || +tn > 0xffff) {
+            console.error(`Invalid TelegramNr "${item}" for ${option}; expected numbers from 0 to 65535.`);
+            process.exit(1);
+        }
+        return String(+tn);
+    }));
+    const needsWrite = option => {
+        if (!has('--write')) { console.error(`Option ${option} needs --write.`); process.exit(1); }
+    };
+
+    // TelegramNrs that get write rows even though Wolf marks them read-only (for example SmartHome set values).
+    const writableOption = want('--writable');
+    if (writableOption) needsWrite('--writable');
+    const forcedWritable = writableOption ? telegramNrList(writableOption, '--writable') : new Set();
+    const forcedWritten = new Set();
+
+    // --ha-yaml prints Home Assistant MQTT entities for the write rows instead of the CSV.
+    const haYamlOption = want('--ha-yaml');
+    if (haYamlOption) needsWrite('--ha-yaml');
+    const haSelection = haYamlOption && haYamlOption.trim().toLowerCase() !== 'all'
+        ? telegramNrList(haYamlOption, '--ha-yaml') : null;
+    const mqttPrefixOption = want('--mqtt-prefix');
+    if (mqttPrefixOption && !haYamlOption) { console.error('Option --mqtt-prefix needs --ha-yaml.'); process.exit(1); }
+    const mqttPrefix = mqttPrefixOption || 'ebusd';
+    if (!/^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/.test(mqttPrefix)) {
+        console.error(`Invalid MQTT prefix "${mqttPrefix}"; expected letters, digits, "_" or "-", separated by "/".`);
+        process.exit(1);
+    }
+    const haEntities = [];
+
+    const csv = has('--csv') || Boolean(haYamlOption);
     if (!csv) {
         for (const dev of targetDevices) {
             const R = rows(dev.template, C, P);
@@ -299,22 +395,24 @@ function main() {
         return;
     }
 
-    // ---- CSV output ----
-    console.log('# type,class,name,comment,QQ,ZZ,PBSB,ID,field,part,type,divider,unit,comment');
-    console.log(`# Generated by wolf-registers.js for: ${deviceNames.join(', ')}`);
+    // ---- CSV output (suppressed when --ha-yaml prints YAML instead) ----
+    const emit = haYamlOption ? () => {} : line => console.log(line);
+    emit('# type,class,name,comment,QQ,ZZ,PBSB,ID,field,part,type,divider,unit,comment');
+    emit(`# Generated by wolf-registers.js for: ${deviceNames.join(', ')}`);
     for (const dev of targetDevices) {
-        console.log(`# ${dev.template.name} (DTID ${dev.template.dtid}, WRSDeviceIds ${dev.template.wrs}, read address ${dev.address})`);
+        emit(`# ${dev.template.name} (DTID ${dev.template.dtid}, WRSDeviceIds ${dev.template.wrs}, read address ${dev.address})`);
     }
-    console.log('# read  ID = <crc8 poly 0x5c over low byte, XOR high byte><TelegramNr LE>');
-    console.log('# write ID = 00<TelegramNr LE>, plus a 4-byte suffix 9d010000');
-    console.log(`# poll priority: r${POLL_MEASUREMENT} read-only values with unit and bitfields, r${POLL_STATUS} other read-only values, r${POLL_SETTING} settings`);
-    console.log('# write address = master address of the read address (read address - 5); verified only for 08 -> 03');
+    emit('# read  ID = <crc8 poly 0x5c over low byte, XOR high byte><TelegramNr LE>');
+    emit('# write ID = 00<TelegramNr LE>, plus a 4-byte suffix 9d010000');
+    emit(`# poll priority: r${POLL_MEASUREMENT} read-only values with unit and bitfields, r${POLL_STATUS} other read-only values, r${POLL_SETTING} settings`);
+    emit(`# write address = master address of the read address (read address - 5); verified for ${VERIFIED_WRITE_ADDRESSES.map(w => `${hx(parseInt(w, 16) + 5)} -> ${w}`).join(' and ')}`);
 
     const seenReadIds = new Map();
     const warnedReadDuplicates = new Set();
     const seenWriteIds = new Set();
     const variantsEmitted = [];
     let readRowsEmitted = 0;
+    let writeRowsEmitted = 0;
     // Bitfields: Wolf defines one parameter per bit of a 16-bit telegram. ebusd allows one message per
     // ID, so all bits of a telegram (at one address) are collected and emitted as one multi-field message.
     const bitGroups = new Map();
@@ -343,8 +441,8 @@ function main() {
         const writeAddress = writeAddressFor(dev.address);
         if (has('--write') && !writeAddress) {
             console.error(`# No write rows for ${dev.reqName}: read address ${dev.address} is not the slave address of an eBUS master.`);
-        } else if (has('--write') && writeAddress !== '03') {
-            console.error(`# Warning: write rows for ${dev.reqName} go to ${writeAddress}; only 03 has been verified. Test on a harmless register first.`);
+        } else if (has('--write') && !VERIFIED_WRITE_ADDRESSES.includes(writeAddress)) {
+            console.error(`# Warning: write rows for ${dev.reqName} go to ${writeAddress}; only ${VERIFIED_WRITE_ADDRESSES.join(' and ')} have been verified. Test on a harmless register first.`);
         }
         let skippedShared = 0;
 
@@ -399,15 +497,28 @@ function main() {
             const prefix = isVariant ? '#' : '';
             if (!isVariant) readRowsEmitted++;
             const prio = pollPriority(r, dec);
-            console.log(`${prefix}r${prio},${cls},${finalN},${cmt},,${readAddress},5022,${readIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note}`);
+            emit(`${prefix}r${prio},${cls},${finalN},${cmt},,${readAddress},5022,${readIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note}`);
 
             // ---- WRITE ROW ----
-            if (has('--write') && writeAddress && !r.readOnly && !dec.note && /NumericInput|ComboBox/.test(r.ctrl || '') && r.min !== '') {
+            // --writable overrides the read-only flag and the missing range, never the control type.
+            const tnKey = String(+r.tn);
+            const forced = forcedWritable.has(tnKey);
+            const inputControl = /NumericInput|ComboBox/.test(r.ctrl || '');
+            const editable = !r.readOnly && inputControl && r.min !== '';
+            if (has('--write') && writeAddress && !dec.note && inputControl && (editable || forced)) {
                 const writeIdStr = writeId(r.tn);
                 const writeKey = JSON.stringify([writeAddress, writeIdStr, decodeKey]);
                 if (!seenWriteIds.has(writeKey)) {
                     seenWriteIds.add(writeKey);
-                    console.log(`${prefix}w,${cls},${finalN},${cmt},,${writeAddress},5023,${writeIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note},suffix,,HEX:4,=9d010000,,`);
+                    if (forced && !editable) forcedWritten.add(tnKey);
+                    if (!isVariant) {
+                        writeRowsEmitted++;
+                        if (!haSelection || haSelection.has(tnKey)) {
+                            haEntities.push({ tn: tnKey, cls, name: finalN, label: r.name, unit: dec.unit,
+                                              div: t[1], min: r.min, max: r.max, step: r.step });
+                        }
+                    }
+                    emit(`${prefix}w,${cls},${finalN},${cmt},,${writeAddress},5023,${writeIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note},suffix,,HEX:4,=9d010000,,`);
                 }
             }
         }
@@ -453,13 +564,21 @@ function main() {
             seenReadIds.set(key, new Map([['bits', { cls: g.cls, device: '' }]]));
             readRowsEmitted++;
         }
-        console.log(`${prefix}r${POLL_MEASUREMENT},${g.cls},${name},Bitfield TelegramNr ${g.tn},,${g.address},5022,${readIdStr},${fields.join(',')}`);
+        emit(`${prefix}r${POLL_MEASUREMENT},${g.cls},${name},Bitfield TelegramNr ${g.tn},,${g.address},5022,${readIdStr},${fields.join(',')}`);
+    }
+    if (haYamlOption) printHaYaml(haEntities, haSelection, mqttPrefix);
+    const forcedMissing = [...forcedWritable].filter(tn => !forcedWritten.has(tn));
+    if (forcedWritten.size) {
+        console.error(`# --writable: write rows forced for TelegramNr ${[...forcedWritten].join(', ')}, which Wolf marks read-only. Check each one with a harmless write first.`);
+    }
+    if (forcedMissing.length) {
+        console.error(`# --writable: no forced write row for TelegramNr ${forcedMissing.join(', ')} (unknown, already writable, not an input control, bitfield, time/date, or no write address).`);
     }
     if (variantsEmitted.length) {
         console.error(`\n# ${variantsEmitted.length} metadata variants emitted commented out (same ID, different type/divider/unit). ebusd allows only one definition per ID; swap one in if it matches your device better:`);
         variantsEmitted.forEach(v => console.error('#   ' + v));
     }
-    console.error(`\n# ${readRowsEmitted} read rows emitted for ${deviceNames.join(', ')}.`);
+    console.error(`\n# ${readRowsEmitted} read rows${has('--write') ? ` and ${writeRowsEmitted} write rows` : ''} emitted for ${deviceNames.join(', ')}.`);
     console.error('# Validate before installing:  ebusd --checkconfig --configpath=<dir> --device=ens:127.0.0.1:59999');
 }
 

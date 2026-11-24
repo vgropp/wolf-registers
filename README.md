@@ -93,9 +93,10 @@ addresses and the reserved values `a9`, `aa` and `fe` are rejected.
 
 Write rows go to the master address that belongs to the read address. On eBUS
 this is the read address minus 5, for example `08` -> `03` or `35` -> `30`.
-Only `08` -> `03` has been verified (see [HISTORY.md](./HISTORY.md)). Treat
-writes to other addresses as untested; the generator prints a warning for
-them. If the read address does not belong to a master (for example `50` or
+`08` -> `03` (see [HISTORY.md](./HISTORY.md)) and `35` -> `30` (a BM-2
+that acknowledged a write and returned the new value on the next read) have
+been verified. Treat writes to other addresses as untested; the generator prints a
+warning for them. If the read address does not belong to a master (for example `50` or
 `51` for an MM), the generator emits no write rows for that template and
 reports this on stderr.
 
@@ -175,6 +176,59 @@ priorities.
 Write rows are only generated for parameters Wolf marks as editable (numeric
 input or selection list, not read-only). Time and date parameters are read-only
 in the generated CSV.
+
+Some values that Wolf marks read-only can still be written over eBUS. An
+example is the BM-2 SmartHome set values, which an external SmartHome system
+writes instead of the ISM7. `--writable` forces write rows for the TelegramNrs
+you list:
+
+```sh
+node wolf-registers.js --device WW_BM-2,BM-2 --address WW_BM-2=35,BM-2=35 \
+  --csv --write --writable 10903,10904 > wolf.csv
+```
+
+The generator lists the forced TelegramNrs on stderr, along with any it could
+not force (unknown numbers, parameters without a numeric or selection input,
+bitfields, time and date values, and devices without a write address). Test each forced value first: write the value it
+already has, then a small change, and read it back after each write. A value
+the device accepts may still have no effect. A BM-2, for example, stores the
+SmartHome set values but keeps passing its own set values to the heat
+generator while `busconfig_smarthome_system` reports no connected SmartHome
+system, even with `freigabe_smarthome` enabled. The `bits_10923` fields show
+whether a circuit is controlled by the BM-2 or by SmartHome.
+
+### Home Assistant input fields for write rows
+
+ebusd's stock `mqtt-hassio.cfg` creates no Home Assistant entities for Wolf
+write messages. It skips writable messages with more than one field, and every
+Wolf write has two: the value and the constant `9d010000` suffix. ebusd still
+accepts writes on `<prefix>/<class>/<name>/set`, so the entities can be
+defined in Home Assistant instead. `--ha-yaml` prints them in place of the CSV:
+
+```sh
+node wolf-registers.js --device WW_BM-2,BM-2 --address WW_BM-2=35,BM-2=35 \
+  --write --ha-yaml 19,10912 > ebusd_write.yaml
+```
+
+Pass `all` or a list of TelegramNrs. Use the same `--device`, `--address` and
+`--writable` options as for the CSV, so that classes and names match. Numeric
+values become `number` entities with the range, step and unit from the
+metadata. Value lists become `select` entities. Merge the output into the
+`mqtt:` section of `configuration.yaml`, or load it as a package: add
+`homeassistant: packages: !include_dir_named packages` to `configuration.yaml`
+and save the file as `packages/ebusd_write.yaml`. Package names must not
+contain `-`. The topics assume ebusd runs with
+`--mqttjson` and the default topic prefix `ebusd`; pass `--mqtt-prefix` if
+yours differs. `--ha-yaml` implies `--csv`. Selecting only the values you need
+is safer than `all`, because many heat pump settings are meant for service
+technicians; `all` also includes values forced with `--writable`. The
+`unique_id` contains the MQTT prefix, so changing the prefix later creates new
+entities in Home Assistant. Each entity is attached to the device that ebusd's
+own discovery creates: name `<prefix> <class>`, identifier `<prefix>_<class>`
+with `/` and other non-alphanumeric characters replaced by `_` (for the
+default prefix, `ebusd cha` and `ebusd_cha`). Pass `--mqtt-prefix` exactly as
+ebusd's `--mqtttopic` without a trailing `/`, or omit it if ebusd runs without
+`--mqtttopic`. Commented-out variant rows get no entity.
 
 Not every metadata entry can be emitted: other unsupported data types and
 parameters without a TelegramNr (for example counters that Wolf combines from
