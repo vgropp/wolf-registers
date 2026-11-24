@@ -1,23 +1,25 @@
-ebusd:
+services:
+  ebusd:
     image: john30/ebusd:latest
     container_name: ebusd
     restart: unless-stopped
     volumes:
       - ./custom-wolf/wolf_all.csv:/etc/ebusd/wolf_all.csv:ro
     ports:
-      - 8888:8888" # ebusctl access
+      - "10888:8888" # ebusctl access
     command:
       - "--foreground"
       - "--configpath=/etc/ebusd"
       - "-d"
-      - "ens:192.168.xx.yy:9999" 
+      - "ens:192.0.2.10:9999" # eBUS adapter
       - --loglevel=error
-      - --mqtthost=192.168.xx.yy
+      - --mqtthost=192.0.2.20 # MQTT broker
       - --mqttport=1883
       - --mqttjson
       # Home Assistant discovery
       - --mqttint=/etc/ebusd/mqtt-hassio.cfg
+      # Only if the broker requires a login
       - --mqttuser=ebusd
       - --mqttpass=<pass>
-      - --pollinterval=60
+      - --pollinterval=30
       - --latency=20000

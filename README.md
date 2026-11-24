@@ -57,21 +57,58 @@ node wolf-registers.js --device DHK_BM-2,MK_BM-2,WW_BM-2,WWSystem_BM-2,MM,ISM,CH
 ```
 
 Names are matched case-insensitively against the templates shown by `--list`.
-The CSV contains rows from each selected template. Rows with the same eBUS
-message signature are emitted only once, so shared registers do not produce
-duplicate message definitions. Register names are made unique within their
-generated class.
+The CSV contains rows from the selected templates. A register is identified by
+its destination address, read ID, type, divider and unit:
+
+- The same register at the same address is emitted only once. If a later
+  template is skipped this way, a summary on stderr says how many entries were
+  skipped and suggests `--address`. Example: `DHK_BM-2,MK_BM-2` without
+  `--address` gives only the `dhk` class, because both templates share their
+  registers at `08`.
+- Metadata variants share an ID but use a different type, divider or unit. For
+  example, TelegramNr 410 is listed as `PRELOAD_Firmware` (UIN) and as
+  `Firmware` (SIN/100), and the MM input E1 is listed as a digital value and as
+  a temperature. ebusd accepts only one definition per address and ID
+  (otherwise it stops loading with `ERR: duplicate entry, duplicate ID`), so
+  the first definition is active and every further variant is emitted
+  commented out (`#r5,...`) and listed on stderr. If a variant matches your
+  device better, comment out the active row and uncomment the variant.
+
+Register names are made unique within their generated class. A single selected template uses the
+`heating` class by default; combined output derives a class from each template
+name. Use `--class <name>` to override the class (for example,
+`--device FGB --class heating --csv`).
+
+Read rows target address `08` by default. If you have confirmed the eBUS
+address for each selected template, map templates to addresses with
+`--address`:
+
+```sh
+node wolf-registers.js --device DHK_BM-2,MK_BM-2 --address DHK_BM-2=08,MK_BM-2=85 --csv > wolf-test.csv
+```
+
+Only use addresses verified for your installation; the template metadata does
+not provide this mapping. The address must be a slave address: master
+addresses and the reserved values `a9`, `aa` and `fe` are rejected.
+
+Write rows go to the master address that belongs to the read address. On eBUS
+this is the read address minus 5, for example `08` -> `03` or `35` -> `30`.
+Only `08` -> `03` has been verified (see [HISTORY.md](./HISTORY.md)). Treat
+writes to other addresses as untested; the generator prints a warning for
+them. If the read address does not belong to a master (for example `50` or
+`51` for an MM), the generator emits no write rows for that template and
+reports this on stderr.
 
 Generated ebusd names cannot begin with a number. The generator moves a
 numeric-leading first segment to the end of the name: for example,
 `1x Warmwasser` becomes `warmwasser_1x`, and `2 Warmwasser` becomes
-`warmwasser_2`. The segment is the text before the first underscore, so this
-rule applies to any numeric-leading token, not just multipliers. A
-numeric-leading name without a following segment receives a `num_` prefix.
-Regenerate existing CSV files to apply the updated naming.
+`warmwasser_2`. If the resulting name still starts with a number, it receives
+a `num_` prefix (for example, `0 - 10 V GLT` becomes
+`num_10_v_glt_0`). Regenerate existing CSV files to apply the updated naming.
 
 You can omit `--write` to generate read rows only. Without `--csv`, the script
-does not generate a register listing; use `--csv` to request ebusd output.
+prints a register listing, including value lists and parameters without a
+TelegramNr. Use `--csv` to request ebusd output.
 
 ## Identifying your template
 
@@ -90,8 +127,11 @@ the script; write IDs use the separate, unchecked write format described in
 [HISTORY.md](./HISTORY.md).
 
 Not every metadata entry can be emitted: unsupported data types and bitfields
-are skipped. Generated rows should be checked against your device and ebusd
-version before use.
+are skipped in CSV output; the non-CSV register listing includes bitfields and
+parameters without a TelegramNr for reference. Generated rows should be
+checked against your device and ebusd version before use. The CSV header
+documents each selected template's DTID and WRSDeviceIds, plus the read-ID
+checksum and write format.
 
 ## Project history
 
