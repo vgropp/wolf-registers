@@ -213,7 +213,9 @@ node wolf-registers.js --device WW_BM-2,BM-2 --address WW_BM-2=35,BM-2=35 \
 Pass `all` or a list of TelegramNrs. Use the same `--device`, `--address` and
 `--writable` options as for the CSV, so that classes and names match. Numeric
 values become `number` entities with the range, step and unit from the
-metadata. Value lists become `select` entities. Merge the output into the
+metadata. Off/on value lists (`0=Aus;1=Ein`, `Nein/Ja`, `inaktiv/aktiv`,
+`deaktiviert/aktiviert`) become `switch` entities, other value lists `select`
+entities. Merge the output into the
 `mqtt:` section of `configuration.yaml`, or load it as a package: add
 `homeassistant: packages: !include_dir_named packages` to `configuration.yaml`
 and save the file as `packages/ebusd_write.yaml`. Package names must not

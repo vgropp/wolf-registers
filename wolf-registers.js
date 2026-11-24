@@ -212,12 +212,15 @@ function ebusName(s) {
 /** Text for a CSV field: no separators, quotes or line breaks. */
 const csvText = s => (s || '').replace(/[\r\n,";]/g, ' ').trim();
 
-/** Home Assistant MQTT entities (number/select) for ebusd write messages, as YAML on stdout. */
+/** Value list texts (off, on) that --ha-yaml turns into a switch instead of a select. */
+const ON_OFF_PAIRS = [['aus', 'ein'], ['nein', 'ja'], ['inaktiv', 'aktiv'], ['deaktiviert', 'aktiviert']];
+
+/** Home Assistant MQTT entities (number/select/switch) for ebusd write messages, as YAML on stdout. */
 function printHaYaml(entities, selection, prefix) {
     // A JSON string is a valid double-quoted YAML scalar once U+2028/U+2029 (YAML line breaks) are escaped.
     const q = v => JSON.stringify(String(v)).replace(/[\u2028\u2029]/g, c => '\\u' + c.charCodeAt(0).toString(16));
     const num = v => (v !== '' && v !== undefined && v !== null && Number.isFinite(+v)) ? +v : null;
-    const numbers = [], selects = [];
+    const numbers = [], selects = [], switches = [];
     // ebusd's %PREFIX: the topic prefix ("ebusd" without --mqtttopic) with every non-alphanumeric character as "_".
     const deviceIdPrefix = prefix.replace(/[^A-Za-z0-9]/g, '_');
     for (const e of entities) {
@@ -241,6 +244,12 @@ function printHaYaml(entities, selection, prefix) {
                 console.error(`# --ha-yaml: no entity for TelegramNr ${e.tn} (${e.cls} ${e.name}): empty or duplicate option texts.`);
                 continue;
             }
+            // A plain off/on list (0=Aus;1=Ein and similar) becomes a switch, everything else a select.
+            const off = String(e.div).match(/^0=([^;]+);1=([^;]+)$/);
+            if (off && ON_OFF_PAIRS.some(([a, b]) => a === off[1].toLowerCase() && b === off[2].toLowerCase())) {
+                switches.push([...common, `      payload_off: ${q(off[1])}`, `      payload_on: ${q(off[2])}`].join('\n'));
+                continue;
+            }
             selects.push([...common, `      options: [${options.map(o => q(o)).join(', ')}]`].join('\n'));
             continue;
         }
@@ -260,12 +269,13 @@ function printHaYaml(entities, selection, prefix) {
     console.log('mqtt:');
     if (numbers.length) console.log('  number:\n' + numbers.join('\n'));
     if (selects.length) console.log('  select:\n' + selects.join('\n'));
+    if (switches.length) console.log('  switch:\n' + switches.join('\n'));
     if (selection) {
         const found = new Set(entities.map(e => e.tn));
         const missing = [...selection].filter(tn => !found.has(tn));
         if (missing.length) console.error(`# --ha-yaml: no write row for TelegramNr ${missing.join(', ')}.`);
     }
-    console.error(`# --ha-yaml: ${numbers.length} number and ${selects.length} select entities.`);
+    console.error(`# --ha-yaml: ${numbers.length} number, ${selects.length} select and ${switches.length} switch entities.`);
 }
 
 function main() {
