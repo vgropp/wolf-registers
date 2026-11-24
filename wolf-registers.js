@@ -66,14 +66,22 @@ const hx = n => n.toString(16).padStart(2, '0');
 /* eBUS master addresses have both nibbles in {0,1,3,7,f}; a master's slave address is master + 5. */
 const MASTER_NIBBLES = [0x0, 0x1, 0x3, 0x7, 0xf];
 // Write addresses confirmed on a real installation (see HISTORY.md and README).
-const VERIFIED_WRITE_ADDRESSES = ['03', '30'];
+const VERIFIED_WRITE_ADDRESSES = ['03', '30', '51', '85'];
 const isMaster = a => MASTER_NIBBLES.includes(a >> 4) && MASTER_NIBBLES.includes(a & 0xf);
-/** Write destination for a read address: the master behind that slave address, or null if there is none. */
-function writeAddressFor(readAddress) {
+/* Write formats seen from ISM7:
+ *  - to the master behind the read address: 5023 00<TN LE><value>9d010000, answered with ACK only
+ *  - directly to a pure slave (no master behind it, e.g. an MM at 51 or a BM-2 mixer circuit at 85):
+ *    5023 <xx><TN LE><value>5d010000. ISM7 varies the first byte; the devices accept 80.
+ *    An MM answers with an empty response; a BM-2 at 85 applies the value but sends no
+ *    response, so ebusd reports a read timeout and repeats the write. */
+const WRITE_VIA_MASTER = { idPrefix: '00', suffix: '9d010000', direct: false };
+const WRITE_DIRECT = { idPrefix: '80', suffix: '5d010000', direct: true };
+/** Write target for a read address: {address, idPrefix, suffix, direct}, or null for invalid addresses. */
+function writeTargetFor(readAddress) {
     const a = parseInt(readAddress, 16);
-    if (a < 0x06) return null;
     const master = a - 5;
-    return isMaster(master) ? hx(master) : null;
+    if (a >= 0x06 && isMaster(master)) return { address: hx(master), ...WRITE_VIA_MASTER };
+    return isValidReadAddress(a) ? { address: hx(a), ...WRITE_DIRECT } : null;
 }
 /** Read rows must target a slave: not a master address, not SYN (aa), escape (a9) or broadcast (fe). */
 const isValidReadAddress = a => !isMaster(a) && ![0xa9, 0xaa, 0xfe].includes(a);
@@ -81,7 +89,7 @@ const isValidReadAddress = a => !isMaster(a) && ![0xa9, 0xaa, 0xfe].includes(a);
 /** Read message ID: <checksum><TelegramNr little-endian> */
 const readId  = tn => hx(wolfCrc(tn)) + hx(tn & 0xff) + hx((tn >> 8) & 0xff);
 /** Write message ID: 00<TelegramNr little-endian> — writes are NOT checksummed */
-const writeId = tn => '00' + hx(tn & 0xff) + hx((tn >> 8) & 0xff);
+const writeId = (tn, prefix = '00') => prefix + hx(tn & 0xff) + hx((tn >> 8) & 0xff);
 
 /* Wolf converter type -> [ebusd base type, divider] */
 const TYPES = {
@@ -413,9 +421,10 @@ function main() {
         emit(`# ${dev.template.name} (DTID ${dev.template.dtid}, WRSDeviceIds ${dev.template.wrs}, read address ${dev.address})`);
     }
     emit('# read  ID = <crc8 poly 0x5c over low byte, XOR high byte><TelegramNr LE>');
-    emit('# write ID = 00<TelegramNr LE>, plus a 4-byte suffix 9d010000');
+    emit('# write ID = 00<TelegramNr LE>, plus a 4-byte suffix 9d010000 (to the master behind the read address)');
+    emit('#          = 80<TelegramNr LE>, plus a 4-byte suffix 5d010000 (directly to a slave without master)');
     emit(`# poll priority: r${POLL_MEASUREMENT} read-only values with unit and bitfields, r${POLL_STATUS} other read-only values, r${POLL_SETTING} settings`);
-    emit(`# write address = master address of the read address (read address - 5); verified for ${VERIFIED_WRITE_ADDRESSES.map(w => `${hx(parseInt(w, 16) + 5)} -> ${w}`).join(' and ')}`);
+    emit(`# write address = master address of the read address (read address - 5), else the read address itself; verified: 08 -> 03, 35 -> 30, direct 51 and 85`);
 
     const seenReadIds = new Map();
     const warnedReadDuplicates = new Set();
@@ -448,11 +457,15 @@ function main() {
 
         if (!seenNamesPerClass.has(cls)) seenNamesPerClass.set(cls, new Set());
 
-        const writeAddress = writeAddressFor(dev.address);
-        if (has('--write') && !writeAddress) {
-            console.error(`# No write rows for ${dev.reqName}: read address ${dev.address} is not the slave address of an eBUS master.`);
+        const writeTarget = writeTargetFor(dev.address);
+        const writeAddress = writeTarget && writeTarget.address;
+        if (has('--write') && !writeTarget) {
+            console.error(`# No write rows for ${dev.reqName}: read address ${dev.address} cannot be written.`);
         } else if (has('--write') && !VERIFIED_WRITE_ADDRESSES.includes(writeAddress)) {
-            console.error(`# Warning: write rows for ${dev.reqName} go to ${writeAddress}; only ${VERIFIED_WRITE_ADDRESSES.join(' and ')} have been verified. Test on a harmless register first.`);
+            console.error(`# Warning: write rows for ${dev.reqName} go to ${writeAddress}; only ${VERIFIED_WRITE_ADDRESSES.join(', ')} have been verified. Test on a harmless register first.`);
+        }
+        if (has('--write') && writeTarget && writeTarget.direct) {
+            console.error(`# Note: write rows for ${dev.reqName} go directly to slave ${writeAddress}. If ebusd reports a read timeout for these writes, check the value: some devices (a BM-2 at 85) apply it without answering.`);
         }
         let skippedShared = 0;
 
@@ -516,7 +529,7 @@ function main() {
             const inputControl = /NumericInput|ComboBox/.test(r.ctrl || '');
             const editable = !r.readOnly && inputControl && r.min !== '';
             if (has('--write') && writeAddress && !dec.note && inputControl && (editable || forced)) {
-                const writeIdStr = writeId(r.tn);
+                const writeIdStr = writeId(r.tn, writeTarget.idPrefix);
                 const writeKey = JSON.stringify([writeAddress, writeIdStr, decodeKey]);
                 if (!seenWriteIds.has(writeKey)) {
                     seenWriteIds.add(writeKey);
@@ -528,7 +541,7 @@ function main() {
                                               div: t[1], min: r.min, max: r.max, step: r.step });
                         }
                     }
-                    emit(`${prefix}w,${cls},${finalN},${cmt},,${writeAddress},5023,${writeIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note},suffix,,HEX:4,=9d010000,,`);
+                    emit(`${prefix}w,${cls},${finalN},${cmt},,${writeAddress},5023,${writeIdStr},${finalN},,${t[0]},${t[1]},${csvText(dec.unit)},TelegramNr ${r.tn}${dec.note},suffix,,HEX:4,=${writeTarget.suffix},,`);
                 }
             }
         }

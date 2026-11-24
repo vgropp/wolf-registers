@@ -93,12 +93,19 @@ addresses and the reserved values `a9`, `aa` and `fe` are rejected.
 
 Write rows go to the master address that belongs to the read address. On eBUS
 this is the read address minus 5, for example `08` -> `03` or `35` -> `30`.
-`08` -> `03` (see [HISTORY.md](./HISTORY.md)) and `35` -> `30` (a BM-2
-that acknowledged a write and returned the new value on the next read) have
-been verified. Treat writes to other addresses as untested; the generator prints a
-warning for them. If the read address does not belong to a master (for example `50` or
-`51` for an MM), the generator emits no write rows for that template and
-reports this on stderr.
+These writes use the ID `00<TelegramNr LE>` and the suffix `9d010000`.
+
+If the read address does not belong to a master (for example `85` for a BM-2
+mixer circuit or `51` for an MM), the write goes directly to the read address,
+as ISM7 does it: ID `80<TelegramNr LE>` and suffix `5d010000`. ISM7 varies the
+first byte, but the devices also accept `80`. An MM answers with an empty
+response. A BM-2 at `85` applies the value but sends ebusd no response, so
+ebusd logs a read timeout and repeats the write; the value is still set.
+
+Verified so far: `08` -> `03` (see [HISTORY.md](./HISTORY.md)), `35` -> `30`,
+and direct writes to `51` and `85`, each by writing a value and reading it
+back. Treat writes to other addresses as untested; the generator prints a
+warning for them.
 
 Generated ebusd names cannot begin with a number. The generator moves a
 numeric-leading first segment to the end of the name: for example,
